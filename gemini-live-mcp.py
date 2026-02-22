@@ -142,8 +142,11 @@ async def _reset_chrome_mic():
     temporary settings tab, selects the system default device, and closes it.
     """
     try:
-        # Open settings tab via CDP
-        resp = _http_get(f'{CDP_URL}/json/new?chrome://settings/content/microphone')
+        # Open settings tab via CDP (requires PUT method)
+        req = urllib.request.Request(
+            f'{CDP_URL}/json/new?chrome://settings/content/microphone', method='PUT')
+        with urllib.request.urlopen(req, timeout=5) as r:
+            resp = json.loads(r.read())
         ws_url = resp['webSocketDebuggerUrl']
         tab_id = resp['id']
         await asyncio.sleep(1.5)  # Settings page needs time to render shadow DOM
