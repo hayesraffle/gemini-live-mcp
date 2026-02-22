@@ -124,11 +124,13 @@ def _ensure_audio_routed():
 
 
 def _restore_audio():
-    """atexit handler: restore original audio devices."""
+    """Restore original audio devices. Called by stop_session and atexit."""
+    global _audio_routed
     if _original_input:
         _run_switch(['-s', _original_input, '-t', 'input'])
     if _original_output:
         _run_switch(['-s', _original_output, '-t', 'output'])
+    _audio_routed = False
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +342,8 @@ async def stop_session() -> str:
     page = _get_page_target()
     async with websockets.connect(page['webSocketDebuggerUrl'], open_timeout=5) as ws:
         await _cdp_send(ws, 'Page.navigate', {'url': 'about:blank'})
-    return 'Navigated to about:blank — session ended.'
+    _restore_audio()
+    return 'Navigated to about:blank — session ended. Audio restored.'
 
 
 @mcp.tool()
