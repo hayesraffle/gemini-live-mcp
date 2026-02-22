@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-gemini-live-mcp: Generic MCP Server for Gemini Live Chrome Extensions
+gemini-live-mcp: Generic MCP Server for Gemini Live Chrome Extensions & Web Apps
 
 Exposes MCP tools for interfacing with and debugging live Gemini sessions
-running inside any Gemini Live Chrome extension. All extension-specific
-config is provided via environment variables (GLMCP_*).
+running inside Chrome extensions or web apps. All target-specific config
+is provided via environment variables (GLMCP_*).
+
+Two modes:
+  - extension (default): For Chrome extensions with Shadow DOM + offscreen docs.
+  - webapp: For web apps that expose a `window.__mcp` bridge object.
 
 Prerequisites:
   1. Chrome running with --remote-debugging-port=9222
-  2. Target extension loaded (unpacked from its build output)
+  2. Extension mode: Target extension loaded (unpacked from its build output)
+     Webapp mode: Target web app running (e.g. via Vite dev server)
   3. For voice tools: GLMCP_VOICE_SCRIPT set
      (audio routing auto-configured on macOS with SwitchAudioSource + BlackHole)
 
-Required env vars:
+Required env vars (extension mode only):
   GLMCP_SHADOW_HOST     - Shadow DOM host selector (e.g. #my-ext-root)
   GLMCP_FAB_SELECTOR    - CSS selector for the start/FAB button
   GLMCP_CLOSE_SELECTOR  - CSS selector for the close/stop button
   GLMCP_EXTENSION_NAME  - Extension name as shown in chrome://extensions
 
 Optional env vars:
+  GLMCP_MODE            - 'extension' (default) or 'webapp'
   GLMCP_CDP_URL         - Chrome DevTools Protocol URL (default: http://127.0.0.1:9222)
   GLMCP_TRANSCRIPT_PROP - Window property for transcript array (default: __tcTranscripts)
   GLMCP_SW_URL_SUFFIX   - Service worker URL suffix (default: /background.js)
@@ -27,7 +33,7 @@ Optional env vars:
   GLMCP_DEFAULT_URL     - Default test URL (default: Wikipedia Tyrannosaurus)
   GLMCP_VOICE_SCRIPT    - Path to TTS script for speak tool (optional)
 
-Add to .mcp.json:
+Add to .mcp.json (extension mode):
   "my-ext": {
     "command": "/path/to/.venv/bin/python",
     "args": ["/path/to/gemini-live-mcp.py"],
@@ -36,6 +42,16 @@ Add to .mcp.json:
       "GLMCP_FAB_SELECTOR": ".start-btn",
       "GLMCP_CLOSE_SELECTOR": ".stop-btn",
       "GLMCP_EXTENSION_NAME": "My Extension"
+    }
+  }
+
+Add to .mcp.json (webapp mode):
+  "my-app": {
+    "command": "/path/to/.venv/bin/python",
+    "args": ["/path/to/gemini-live-mcp.py"],
+    "env": {
+      "GLMCP_MODE": "webapp",
+      "GLMCP_DEFAULT_URL": "http://localhost:5173"
     }
   }
 """
@@ -56,17 +72,24 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
+MODE = os.environ.get('GLMCP_MODE', 'extension')
 CDP_URL = os.environ.get('GLMCP_CDP_URL', 'http://127.0.0.1:9222')
-SHADOW_HOST = os.environ['GLMCP_SHADOW_HOST']
-FAB_SEL = os.environ['GLMCP_FAB_SELECTOR']
-CLOSE_BTN_SEL = os.environ['GLMCP_CLOSE_SELECTOR']
-EXTENSION_NAME = os.environ['GLMCP_EXTENSION_NAME']
+DEFAULT_TEST_URL = os.environ.get('GLMCP_DEFAULT_URL', 'https://en.wikipedia.org/wiki/Tyrannosaurus')
+VOICE_SCRIPT = os.environ.get('GLMCP_VOICE_SCRIPT', '')
+
+# Extension-mode-only config (not required for webapp mode)
+if MODE == 'extension':
+    SHADOW_HOST = os.environ['GLMCP_SHADOW_HOST']
+    FAB_SEL = os.environ['GLMCP_FAB_SELECTOR']
+    CLOSE_BTN_SEL = os.environ['GLMCP_CLOSE_SELECTOR']
+    EXTENSION_NAME = os.environ['GLMCP_EXTENSION_NAME']
+else:
+    SHADOW_HOST = FAB_SEL = CLOSE_BTN_SEL = EXTENSION_NAME = ''
+
 TRANSCRIPT_PROP = os.environ.get('GLMCP_TRANSCRIPT_PROP', '__tcTranscripts')
 SW_URL_SUFFIX = os.environ.get('GLMCP_SW_URL_SUFFIX', '/background.js')
 SW_URL_EXCLUDE = os.environ.get('GLMCP_SW_URL_EXCLUDE', '/build/')
 OFFSCREEN_URL = os.environ.get('GLMCP_OFFSCREEN_URL', 'offscreen.html')
-DEFAULT_TEST_URL = os.environ.get('GLMCP_DEFAULT_URL', 'https://en.wikipedia.org/wiki/Tyrannosaurus')
-VOICE_SCRIPT = os.environ.get('GLMCP_VOICE_SCRIPT', '')
 
 mcp = FastMCP('gemini-live-mcp')
 
@@ -270,6 +293,27 @@ async def _offscreen_eval(expression):
         return await _cdp_eval(ws, expression)
 
 
+def _get_mcp_target():
+    """Return the CDP target where window.__mcp lives.
+
+    Extension mode: the offscreen document.
+    Webapp mode: the main page tab.
+    """
+    if MODE == 'extension':
+        t = _get_offscreen_target()
+        if not t:
+            raise RuntimeError('No offscreen target — start a session first.')
+        return t
+    return _get_page_target()
+
+
+async def _mcp_eval(expression):
+    """Evaluate JS against the MCP bridge target."""
+    t = _get_mcp_target()
+    async with websockets.connect(t['webSocketDebuggerUrl'], open_timeout=5) as ws:
+        return await _cdp_eval(ws, expression)
+
+
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
@@ -278,16 +322,60 @@ async def _offscreen_eval(expression):
 async def get_session_state() -> str:
     """
     Returns the current state of the Gemini Live session:
-    extension ID, page URL, whether the session is active (close button
-    visible vs FAB visible), offscreen doc status, and transcript count.
+    page URL, whether the session is active, transcript count, and audio status.
+    In extension mode, also includes extension ID and offscreen doc status.
     """
+    page = _get_page_target()
+    page_url = page.get('url', 'unknown')
+
+    if MODE == 'webapp':
+        # Webapp mode: read state from window.__mcp
+        try:
+            state = await _page_eval("""
+                (() => {
+                    const m = window.__mcp;
+                    if (!m) return { bridge: false };
+                    return {
+                        bridge: true,
+                        isConnected: !!m.isConnected,
+                        transcripts: (m.transcripts || []).length,
+                        sessionState: m.sessionState || null,
+                    };
+                })()
+            """)
+        except Exception as e:
+            state = {'bridge': False, 'error': str(e)}
+
+        if not state.get('bridge'):
+            session_state = 'no bridge (window.__mcp not found)'
+            transcript_count = 0
+        else:
+            session_state = 'active' if state.get('isConnected') else 'inactive'
+            if state.get('sessionState'):
+                session_state += f' ({state["sessionState"]})'
+            transcript_count = state.get('transcripts', 0)
+
+        # Audio routing status
+        if not shutil.which('SwitchAudioSource'):
+            audio_status = 'unknown (SwitchAudioSource not available)'
+        else:
+            current_input, _ = _get_current_audio()
+            routed = 'routed' if _audio_routed else 'not routed'
+            audio_status = f'{current_input} ({routed})'
+
+        return (
+            f'Mode         : webapp\n'
+            f'Page URL     : {page_url}\n'
+            f'Session state: {session_state}\n'
+            f'Transcripts  : {transcript_count} entries\n'
+            f'Audio        : {audio_status}'
+        )
+
+    # Extension mode
     try:
         ext_id, _ = _detect_ext_id()
     except RuntimeError as e:
         return f'ERROR: {e}'
-
-    page = _get_page_target()
-    page_url = page.get('url', 'unknown')
 
     try:
         session_state = await _page_eval(f"""
@@ -326,6 +414,7 @@ async def get_session_state() -> str:
         audio_status = f'{current_input} ({routed})'
 
     return (
+        f'Mode         : extension\n'
         f'Extension ID : {ext_id}\n'
         f'Page URL     : {page_url}\n'
         f'Session state: {session_state}\n'
@@ -339,8 +428,8 @@ async def get_session_state() -> str:
 async def start_session(url: str = DEFAULT_TEST_URL) -> str:
     """
     Navigate to a URL (or reload if already there) and start a Gemini Live
-    session by clicking the FAB button. Always reloads to guarantee a fresh
-    content script and hub port connection.
+    session. In extension mode, clicks the FAB button. In webapp mode,
+    calls window.__mcp.startSession() and waits for isConnected.
 
     Args:
         url: Page URL to open. Defaults to the configured default URL.
@@ -357,45 +446,89 @@ async def start_session(url: str = DEFAULT_TEST_URL) -> str:
 
     await asyncio.sleep(3)
 
-    # Wait for content script (up to 15s)
-    deadline = time.time() + 15
-    async with websockets.connect(page_ws, open_timeout=5) as ws:
-        while time.time() < deadline:
-            val = await _cdp_eval(ws, f"!!document.querySelector('{SHADOW_HOST}')")
-            if val:
-                break
-            await asyncio.sleep(0.5)
-        else:
-            return 'ERROR: Content script did not appear within 15s'
+    if MODE == 'webapp':
+        # Wait for window.__mcp to appear (up to 15s)
+        deadline = time.time() + 15
+        async with websockets.connect(page_ws, open_timeout=5) as ws:
+            while time.time() < deadline:
+                val = await _cdp_eval(ws, '!!window.__mcp')
+                if val:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return 'ERROR: window.__mcp did not appear within 15s'
 
-        result = await _cdp_eval(ws, f"""
-            (() => {{
-                const root = document.querySelector('{SHADOW_HOST}')?.shadowRoot;
-                if (!root) return 'no-shadow-root';
-                if (root.querySelector('{CLOSE_BTN_SEL}')) return 'already-active';
-                const fab = root.querySelector('{FAB_SEL}');
-                if (fab) {{ fab.click(); return 'clicked'; }}
-                return 'no-fab';
-            }})()
-        """)
+            # Check if already connected
+            connected = await _cdp_eval(ws, '!!window.__mcp.isConnected')
+            if connected:
+                return f'start_session: already-active (url={url})'
 
-    return f'start_session: {result} (url={url})'
+            # Call startSession if available
+            has_start = await _cdp_eval(ws, 'typeof window.__mcp.startSession === "function"')
+            if has_start:
+                await _cdp_eval(ws, 'window.__mcp.startSession()')
+
+                # Wait for isConnected (up to 15s)
+                deadline2 = time.time() + 15
+                while time.time() < deadline2:
+                    connected = await _cdp_eval(ws, '!!window.__mcp.isConnected')
+                    if connected:
+                        return f'start_session: connected (url={url})'
+                    await asyncio.sleep(0.5)
+                return f'start_session: startSession() called but not connected within 15s (url={url})'
+            else:
+                return f'start_session: bridge found but no startSession function — app may auto-connect (url={url})'
+    else:
+        # Extension mode: wait for content script shadow DOM
+        deadline = time.time() + 15
+        async with websockets.connect(page_ws, open_timeout=5) as ws:
+            while time.time() < deadline:
+                val = await _cdp_eval(ws, f"!!document.querySelector('{SHADOW_HOST}')")
+                if val:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return 'ERROR: Content script did not appear within 15s'
+
+            result = await _cdp_eval(ws, f"""
+                (() => {{
+                    const root = document.querySelector('{SHADOW_HOST}')?.shadowRoot;
+                    if (!root) return 'no-shadow-root';
+                    if (root.querySelector('{CLOSE_BTN_SEL}')) return 'already-active';
+                    const fab = root.querySelector('{FAB_SEL}');
+                    if (fab) {{ fab.click(); return 'clicked'; }}
+                    return 'no-fab';
+                }})()
+            """)
+
+        return f'start_session: {result} (url={url})'
 
 
 @mcp.tool()
 async def stop_session() -> str:
     """
-    End the current Gemini Live session by navigating to about:blank.
-    Uses navigation rather than clicking the close button — clicking the
-    close button breaks the hub port and prevents future sessions from
-    starting on the same page.
+    End the current Gemini Live session. In webapp mode, calls
+    window.__mcp.stopSession() if available, then navigates to about:blank.
+    In extension mode, releases the mic on the offscreen doc first.
     """
-    # Release mic stream before navigating — forces Chrome to re-acquire
-    # the default device on next session start.
-    try:
-        await _offscreen_eval('window.__tcReleaseMic ? window.__tcReleaseMic() : "no-op"')
-    except Exception:
-        pass  # Offscreen may not be running
+    if MODE == 'webapp':
+        # Try calling stopSession on the bridge
+        try:
+            await _page_eval("""
+                (() => {
+                    if (window.__mcp && typeof window.__mcp.stopSession === 'function') {
+                        window.__mcp.stopSession();
+                    }
+                })()
+            """)
+        except Exception:
+            pass
+    else:
+        # Extension mode: release mic stream before navigating
+        try:
+            await _offscreen_eval('window.__tcReleaseMic ? window.__tcReleaseMic() : "no-op"')
+        except Exception:
+            pass
 
     page = _get_page_target()
     async with websockets.connect(page['webSocketDebuggerUrl'], open_timeout=5) as ws:
@@ -455,7 +588,7 @@ async def speak(text: str, use_say: bool = True) -> str:
 async def listen(timeout: int = 60, baseline: int = -1) -> str:
     """
     Wait for a new user+model transcript pair in the transcript array.
-    Polls the offscreen doc every second until a new pair appears.
+    Polls every second until a new pair appears.
 
     Args:
         timeout: Max seconds to wait (default 60).
@@ -466,17 +599,19 @@ async def listen(timeout: int = 60, baseline: int = -1) -> str:
     Returns:
         The captured user and model transcript texts, plus latency.
     """
-    t = _get_offscreen_target()
-    if not t:
-        return 'ERROR: No offscreen target — start a session first.'
+    try:
+        t = _get_mcp_target()
+    except RuntimeError as e:
+        return f'ERROR: {e}'
 
     ws_url = t['webSocketDebuggerUrl']
+    transcript_expr = 'window.__mcp.transcripts' if MODE == 'webapp' else f'window.{TRANSCRIPT_PROP}'
 
     # Auto-baseline: use current length
     if baseline < 0:
         async with websockets.connect(ws_url, open_timeout=5) as ws:
             result = await _cdp_send(ws, 'Runtime.evaluate', {
-                'expression': f'(window.{TRANSCRIPT_PROP} || []).length',
+                'expression': f'({transcript_expr} || []).length',
                 'returnByValue': True,
             })
             baseline = result.get('result', {}).get('value', 0)
@@ -488,7 +623,7 @@ async def listen(timeout: int = 60, baseline: int = -1) -> str:
     async with websockets.connect(ws_url, open_timeout=5) as ws:
         while time.time() < deadline:
             result = await _cdp_send(ws, 'Runtime.evaluate', {
-                'expression': f'JSON.stringify(window.{TRANSCRIPT_PROP} || [])',
+                'expression': f'JSON.stringify({transcript_expr} || [])',
                 'returnByValue': True,
             })
             raw = result.get('result', {}).get('value')
@@ -520,13 +655,16 @@ async def get_transcripts(last_n: int = 10) -> str:
     Args:
         last_n: Number of entries to return (default 10, 0 = all).
     """
-    t = _get_offscreen_target()
-    if not t:
-        return 'No offscreen target — no active session.'
+    try:
+        t = _get_mcp_target()
+    except RuntimeError as e:
+        return f'No active session: {e}'
+
+    transcript_expr = 'window.__mcp.transcripts' if MODE == 'webapp' else f'window.{TRANSCRIPT_PROP}'
 
     async with websockets.connect(t['webSocketDebuggerUrl'], open_timeout=5) as ws:
         result = await _cdp_send(ws, 'Runtime.evaluate', {
-            'expression': f'JSON.stringify(window.{TRANSCRIPT_PROP} || [])',
+            'expression': f'JSON.stringify({transcript_expr} || [])',
             'returnByValue': True,
         })
     raw = result.get('result', {}).get('value', '[]')
@@ -543,18 +681,37 @@ async def get_transcripts(last_n: int = 10) -> str:
 
 
 @mcp.tool()
-async def get_offscreen_logs(last_n: int = 30) -> str:
+async def get_logs(last_n: int = 30) -> str:
     """
-    Return recent console logs from the offscreen hub document.
-    These are debug logs from the offscreen doc — session lifecycle,
-    Gemini connection status, tool calls, errors, etc.
+    Return recent logs. In extension mode, captures console logs from the
+    offscreen hub document. In webapp mode, reads window.__mcp.logs if
+    available, otherwise captures console logs from the page.
 
     Args:
         last_n: Number of most-recent log lines to return (default 30).
     """
-    t = _get_offscreen_target()
-    if not t:
-        return 'No offscreen target.'
+    if MODE == 'webapp':
+        # Try reading structured logs from the bridge first
+        try:
+            raw = await _page_eval('JSON.stringify(window.__mcp && window.__mcp.logs || null)')
+            if raw and raw != 'null':
+                log_entries = json.loads(raw)
+                if log_entries:
+                    lines = []
+                    for entry in log_entries[-last_n:] if last_n > 0 else log_entries:
+                        src = entry.get('source', '')
+                        text = entry.get('text', '')
+                        lines.append(f'[{src}] {text}' if src else text)
+                    return '\n'.join(lines) if lines else 'No logs.'
+        except Exception:
+            pass
+
+        # Fall back to console API on the page
+        t = _get_page_target()
+    else:
+        t = _get_offscreen_target()
+        if not t:
+            return 'No offscreen target.'
 
     logs = []
     async with websockets.connect(t['webSocketDebuggerUrl'], open_timeout=5) as ws:
@@ -597,12 +754,19 @@ async def eval_page(expression: str) -> str:
 @mcp.tool()
 async def eval_offscreen(expression: str) -> str:
     """
-    Evaluate a JavaScript expression in the offscreen hub document context.
-    Useful for inspecting session state, audio context, Gemini connection, etc.
+    Evaluate a JavaScript expression in the offscreen hub document context
+    (extension mode) or the main page context (webapp mode, same as eval_page).
 
     Args:
         expression: JS expression to evaluate. Return value must be JSON-serializable.
     """
+    if MODE == 'webapp':
+        # In webapp mode there's no offscreen doc — redirect to page eval
+        try:
+            result = await _page_eval(expression)
+            return json.dumps(result, indent=2) if result is not None else 'undefined'
+        except Exception as e:
+            return f'ERROR: {e}'
     try:
         result = await _offscreen_eval(expression)
         return json.dumps(result, indent=2) if result is not None else 'undefined'
@@ -630,7 +794,11 @@ async def reload_extension() -> str:
     """
     Reload the extension via chrome://extensions. Use after a build to
     pick up changes. Requires chrome://extensions to be open as a tab.
+    Extension mode only.
     """
+    if MODE == 'webapp':
+        return 'Not available in webapp mode. Use navigate() to reload the page instead.'
+
     targets = _get_targets()
     ext_page = next(
         (t for t in targets if t.get('url', '').startswith('chrome://extensions')),
@@ -685,7 +853,7 @@ async def run_voice_test(
     if not VOICE_SCRIPT:
         return 'ERROR: GLMCP_VOICE_SCRIPT not set — voice test unavailable'
 
-    # Navigate / reload for fresh content script
+    # Navigate / reload
     page = _get_page_target()
     page_ws = page['webSocketDebuggerUrl']
     current_url = page.get('url', '')
@@ -697,39 +865,75 @@ async def run_voice_test(
             await _cdp_send(ws, 'Page.navigate', {'url': url})
     await asyncio.sleep(3)
 
-    # Wait for content script
-    deadline = time.time() + 15
-    async with websockets.connect(page_ws, open_timeout=5) as ws:
-        while time.time() < deadline:
-            val = await _cdp_eval(ws, f"!!document.querySelector('{SHADOW_HOST}')")
-            if val:
+    if MODE == 'webapp':
+        # Wait for window.__mcp bridge (up to 15s)
+        deadline = time.time() + 15
+        async with websockets.connect(page_ws, open_timeout=5) as ws:
+            while time.time() < deadline:
+                val = await _cdp_eval(ws, '!!window.__mcp')
+                if val:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return 'ERROR: window.__mcp did not appear'
+
+            # Start session if not already connected
+            connected = await _cdp_eval(ws, '!!window.__mcp.isConnected')
+            if not connected:
+                has_start = await _cdp_eval(ws, 'typeof window.__mcp.startSession === "function"')
+                if has_start:
+                    await _cdp_eval(ws, 'window.__mcp.startSession()')
+                # Wait for connection
+                deadline2 = time.time() + 15
+                while time.time() < deadline2:
+                    connected = await _cdp_eval(ws, '!!window.__mcp.isConnected')
+                    if connected:
+                        break
+                    await asyncio.sleep(0.5)
+                if not connected:
+                    return 'ERROR: Session did not connect within 15s'
+
+        # Settle + baseline
+        await asyncio.sleep(3)
+        transcript_expr = 'window.__mcp.transcripts'
+        mcp_ws_url = page_ws
+    else:
+        # Extension mode: wait for content script
+        deadline = time.time() + 15
+        async with websockets.connect(page_ws, open_timeout=5) as ws:
+            while time.time() < deadline:
+                val = await _cdp_eval(ws, f"!!document.querySelector('{SHADOW_HOST}')")
+                if val:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return 'ERROR: Content script did not appear'
+            await _cdp_eval(ws, f"""
+                (() => {{
+                    const root = document.querySelector('{SHADOW_HOST}')?.shadowRoot;
+                    root?.querySelector('{FAB_SEL}')?.click();
+                }})()
+            """)
+
+        # Wait for offscreen (up to 15s)
+        mcp_ws_url = None
+        for _ in range(30):
+            t = _get_offscreen_target()
+            if t:
+                mcp_ws_url = t['webSocketDebuggerUrl']
                 break
             await asyncio.sleep(0.5)
-        else:
-            return 'ERROR: Content script did not appear'
-        await _cdp_eval(ws, f"""
-            (() => {{
-                const root = document.querySelector('{SHADOW_HOST}')?.shadowRoot;
-                root?.querySelector('{FAB_SEL}')?.click();
-            }})()
-        """)
+        if not mcp_ws_url:
+            return 'ERROR: Offscreen target did not appear'
 
-    # Wait for offscreen (up to 15s)
-    offscreen_ws_url = None
-    for _ in range(30):
-        t = _get_offscreen_target()
-        if t:
-            offscreen_ws_url = t['webSocketDebuggerUrl']
-            break
-        await asyncio.sleep(0.5)
-    if not offscreen_ws_url:
-        return 'ERROR: Offscreen target did not appear'
+        # Settle
+        await asyncio.sleep(3)
+        transcript_expr = f'window.{TRANSCRIPT_PROP}'
 
-    # Settle + baseline
-    await asyncio.sleep(3)
-    async with websockets.connect(offscreen_ws_url, open_timeout=5) as ws:
+    # Get baseline
+    async with websockets.connect(mcp_ws_url, open_timeout=5) as ws:
         r = await _cdp_send(ws, 'Runtime.evaluate', {
-            'expression': f'(window.{TRANSCRIPT_PROP} || []).length',
+            'expression': f'({transcript_expr} || []).length',
             'returnByValue': True,
         })
         baseline = r.get('result', {}).get('value', 0)
@@ -752,10 +956,10 @@ async def run_voice_test(
     # Poll for transcript
     deadline = time.time() + 90
     user_text = model_text = None
-    async with websockets.connect(offscreen_ws_url, open_timeout=5) as ws:
+    async with websockets.connect(mcp_ws_url, open_timeout=5) as ws:
         while time.time() < deadline:
             r = await _cdp_send(ws, 'Runtime.evaluate', {
-                'expression': f'JSON.stringify(window.{TRANSCRIPT_PROP} || [])',
+                'expression': f'JSON.stringify({transcript_expr} || [])',
                 'returnByValue': True,
             })
             raw = r.get('result', {}).get('value')

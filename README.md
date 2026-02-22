@@ -1,16 +1,20 @@
 # gemini-live-mcp
 
-A generic [MCP](https://modelcontextprotocol.io/) server for interacting with **Gemini Live** Chrome extensions from AI coding agents like [Claude Code](https://claude.ai/code).
+A generic [MCP](https://modelcontextprotocol.io/) server for interacting with **Gemini Live** Chrome extensions and web apps from AI coding agents like [Claude Code](https://claude.ai/code).
 
 It connects to Chrome via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) and exposes tools to start/stop voice sessions, speak utterances, capture transcripts, inspect state, and run end-to-end voice tests -- all from your MCP client.
 
-Works with any Gemini Live Chrome extension that uses an offscreen document for audio and a Shadow DOM overlay for its UI. All extension-specific details (selectors, extension name, transcript property) are configured via environment variables.
+**Two modes:**
+
+- **Extension mode** (default): For Chrome extensions with Shadow DOM overlays + offscreen documents. All extension-specific details (selectors, extension name, transcript property) are configured via environment variables.
+- **Webapp mode**: For web apps (React, etc.) that expose a `window.__mcp` bridge object. No extension-specific config needed.
 
 ## Requirements
 
 - Python 3.10+
 - Chrome running with `--remote-debugging-port=9222`
-- Your Gemini Live extension loaded in Chrome
+- Extension mode: your Gemini Live extension loaded in Chrome
+- Webapp mode: your web app running (e.g. via Vite dev server)
 - Python packages: `websockets`, `mcp`
 
 ## Installation
@@ -28,6 +32,8 @@ pip install websockets mcp
 ```
 
 ## Configuration
+
+### Extension Mode (default)
 
 Add to your `.mcp.json` (e.g. in your project root for Claude Code):
 
@@ -48,16 +54,34 @@ Add to your `.mcp.json` (e.g. in your project root for Claude Code):
 }
 ```
 
+### Webapp Mode
+
+```json
+{
+  "mcpServers": {
+    "gemini-live": {
+      "command": "/path/to/.venv/bin/python",
+      "args": ["/path/to/gemini-live-mcp.py"],
+      "env": {
+        "GLMCP_MODE": "webapp",
+        "GLMCP_DEFAULT_URL": "http://localhost:5173"
+      }
+    }
+  }
+}
+```
+
 ### Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GLMCP_SHADOW_HOST` | Yes | -- | Shadow DOM host selector (e.g. `#my-ext-root`) |
-| `GLMCP_FAB_SELECTOR` | Yes | -- | CSS selector for the start/FAB button inside the shadow root |
-| `GLMCP_CLOSE_SELECTOR` | Yes | -- | CSS selector for the close/stop button inside the shadow root |
-| `GLMCP_EXTENSION_NAME` | Yes | -- | Extension name as shown in `chrome://extensions` |
+| `GLMCP_MODE` | No | `extension` | `extension` or `webapp` |
+| `GLMCP_SHADOW_HOST` | Extension only | -- | Shadow DOM host selector (e.g. `#my-ext-root`) |
+| `GLMCP_FAB_SELECTOR` | Extension only | -- | CSS selector for the start/FAB button inside the shadow root |
+| `GLMCP_CLOSE_SELECTOR` | Extension only | -- | CSS selector for the close/stop button inside the shadow root |
+| `GLMCP_EXTENSION_NAME` | Extension only | -- | Extension name as shown in `chrome://extensions` |
 | `GLMCP_CDP_URL` | No | `http://127.0.0.1:9222` | Chrome DevTools Protocol URL |
-| `GLMCP_TRANSCRIPT_PROP` | No | `__tcTranscripts` | `window` property name for the transcript array |
+| `GLMCP_TRANSCRIPT_PROP` | No | `__tcTranscripts` | `window` property name for transcript array (extension mode) |
 | `GLMCP_SW_URL_SUFFIX` | No | `/background.js` | Service worker URL suffix for extension detection |
 | `GLMCP_SW_URL_EXCLUDE` | No | `/build/` | Substring to exclude from SW URL matching |
 | `GLMCP_OFFSCREEN_URL` | No | `offscreen.html` | Substring to match the offscreen document URL |
@@ -68,18 +92,51 @@ Add to your `.mcp.json` (e.g. in your project root for Claude Code):
 
 | Tool | Description |
 |------|-------------|
-| `get_session_state` | Check extension ID, page URL, session status, offscreen doc, transcript count |
-| `start_session` | Navigate to a URL and click the FAB to start a Gemini Live session |
-| `stop_session` | End the session by navigating to `about:blank` |
+| `get_session_state` | Check page URL, session status, transcript count, audio routing |
+| `start_session` | Navigate to a URL and start a Gemini Live session |
+| `stop_session` | End the session |
 | `speak` | Generate TTS audio and play it into a virtual mic (requires `GLMCP_VOICE_SCRIPT`) |
 | `listen` | Poll for new user+model transcript pair with timeout |
 | `get_transcripts` | Return the last N transcript entries |
-| `get_offscreen_logs` | Return recent console logs from the offscreen hub document |
+| `get_logs` | Return recent logs (console or structured) |
 | `eval_page` | Evaluate JavaScript in the main page context |
-| `eval_offscreen` | Evaluate JavaScript in the offscreen document context |
+| `eval_offscreen` | Evaluate JavaScript in the offscreen/page context |
 | `navigate` | Navigate the main page to a URL |
-| `reload_extension` | Reload the extension via `chrome://extensions` |
+| `reload_extension` | Reload the extension via `chrome://extensions` (extension mode only) |
 | `run_voice_test` | Full end-to-end test: navigate, start session, speak, capture transcript, assert |
+
+## `window.__mcp` Bridge Contract (Webapp Mode)
+
+Web apps expose state to the MCP server by setting `window.__mcp`:
+
+```typescript
+interface MCPBridge {
+  transcripts: Array<{ role: 'user' | 'model'; text: string }>;
+  isConnected: boolean;
+  startSession?: () => void;
+  stopSession?: () => void;
+  sessionState?: string;
+  logs?: Array<{ source: string; text: string }>;
+}
+```
+
+### Adding the bridge to a React app
+
+Add a `useEffect` that syncs your React state to `window.__mcp`:
+
+```tsx
+useEffect(() => {
+  (window as any).__mcp = {
+    transcripts: transcriptHistory,
+    isConnected,
+    startSession: () => startSession(),
+    stopSession: () => stopSession(),
+  };
+  return () => { delete (window as any).__mcp; };
+}, [transcriptHistory, isConnected, startSession, stopSession]);
+```
+
+A TypeScript helper module (`mcp-bridge.ts`) is also provided for convenience.
 
 ## Chrome Setup
 
@@ -94,7 +151,9 @@ Quit Chrome completely first, then launch with the debug port:
   "about:blank"
 ```
 
-Load your extension as unpacked at `chrome://extensions` (Developer mode).
+Extension mode: load your extension as unpacked at `chrome://extensions` (Developer mode).
+
+Webapp mode: open your web app URL (e.g. `http://localhost:5173`).
 
 ## Audio Routing (macOS)
 
@@ -126,7 +185,9 @@ The `speak` and `run_voice_test` tools require:
 
 ## Transcript Contract
 
-The server expects the extension's offscreen document to expose transcripts on `window` as an array of objects with `{ role: 'user' | 'model', text: string }`. The property name defaults to `__tcTranscripts` but is configurable via `GLMCP_TRANSCRIPT_PROP`.
+**Extension mode:** The server reads transcripts from `window.<GLMCP_TRANSCRIPT_PROP>` on the offscreen document — an array of `{ role: 'user' | 'model', text: string }`. Defaults to `__tcTranscripts`.
+
+**Webapp mode:** The server reads `window.__mcp.transcripts` on the page — same format.
 
 ## License
 
