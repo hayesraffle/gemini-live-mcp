@@ -124,13 +124,61 @@ def _ensure_audio_routed():
 
 
 def _restore_audio():
-    """Restore original audio devices. Called by stop_session and atexit."""
+    """Restore original OS audio devices. Called by stop_session and atexit."""
     global _audio_routed
     if _original_input:
         _run_switch(['-s', _original_input, '-t', 'input'])
     if _original_output:
         _run_switch(['-s', _original_output, '-t', 'output'])
     _audio_routed = False
+
+
+async def _reset_chrome_mic():
+    """Reset Chrome's internal mic preference to the system default device.
+
+    Chrome has its own mic dropdown (chrome://settings/content/microphone)
+    that persists across restarts and overrides the OS default. When tests
+    route audio through BlackHole, Chrome latches onto it. This opens a
+    temporary settings tab, selects the system default device, and closes it.
+    """
+    try:
+        # Open settings tab via CDP
+        resp = _http_get(f'{CDP_URL}/json/new?chrome://settings/content/microphone')
+        ws_url = resp['webSocketDebuggerUrl']
+        tab_id = resp['id']
+        await asyncio.sleep(1.5)  # Settings page needs time to render shadow DOM
+
+        async with websockets.connect(ws_url, open_timeout=5) as ws:
+            # Chrome settings uses deep shadow DOM — recursive search finds the native <select>
+            result = await _cdp_eval(ws, """
+                (() => {
+                    function findSelects(root) {
+                        const results = [];
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.tagName === 'SELECT') results.push(el);
+                            if (el.shadowRoot) results.push(...findSelects(el.shadowRoot));
+                        }
+                        return results;
+                    }
+                    const sel = findSelects(document)[0];
+                    if (!sel) return 'no select found';
+                    for (const opt of sel.options) {
+                        if (opt.text.includes('System default') || opt.text.includes('Built-in')) {
+                            if (sel.value === opt.value) return 'already set to: ' + opt.text;
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            return 'set to: ' + opt.text;
+                        }
+                    }
+                    return 'no system default option found';
+                })()
+            """)
+
+        # Close the settings tab
+        _http_get(f'{CDP_URL}/json/close/{tab_id}')
+        return result
+    except Exception as e:
+        return f'failed: {e}'
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +387,8 @@ async def stop_session() -> str:
     close button breaks the hub port and prevents future sessions from
     starting on the same page.
     """
-    # Release mic stream before navigating — prevents Chrome from caching
-    # the test audio device (BlackHole) as the default for future sessions.
+    # Release mic stream before navigating — forces Chrome to re-acquire
+    # the default device on next session start.
     try:
         await _offscreen_eval('window.__tcReleaseMic ? window.__tcReleaseMic() : "no-op"')
     except Exception:
@@ -349,8 +397,18 @@ async def stop_session() -> str:
     page = _get_page_target()
     async with websockets.connect(page['webSocketDebuggerUrl'], open_timeout=5) as ws:
         await _cdp_send(ws, 'Page.navigate', {'url': 'about:blank'})
+
+    # Restore OS audio devices
+    was_routed = _audio_routed
     _restore_audio()
-    return 'Navigated to about:blank — session ended. Mic released, audio restored.'
+
+    # Reset Chrome's internal mic preference (persists across restarts,
+    # overrides OS default — must be reset via the settings page)
+    mic_result = 'skipped'
+    if was_routed:
+        mic_result = await _reset_chrome_mic()
+
+    return f'Session ended. Audio restored. Chrome mic: {mic_result}'
 
 
 @mcp.tool()
