@@ -339,11 +339,18 @@ async def stop_session() -> str:
     close button breaks the hub port and prevents future sessions from
     starting on the same page.
     """
+    # Release mic stream before navigating — prevents Chrome from caching
+    # the test audio device (BlackHole) as the default for future sessions.
+    try:
+        await _offscreen_eval('window.__tcReleaseMic ? window.__tcReleaseMic() : "no-op"')
+    except Exception:
+        pass  # Offscreen may not be running
+
     page = _get_page_target()
     async with websockets.connect(page['webSocketDebuggerUrl'], open_timeout=5) as ws:
         await _cdp_send(ws, 'Page.navigate', {'url': 'about:blank'})
     _restore_audio()
-    return 'Navigated to about:blank — session ended. Audio restored.'
+    return 'Navigated to about:blank — session ended. Mic released, audio restored.'
 
 
 @mcp.tool()
