@@ -9,7 +9,8 @@ config is provided via environment variables (GLMCP_*).
 Prerequisites:
   1. Chrome running with --remote-debugging-port=9222
   2. Target extension loaded (unpacked from its build output)
-  3. For voice tools: GLMCP_VOICE_SCRIPT set + audio routing configured
+  3. For voice tools: GLMCP_VOICE_SCRIPT set
+     (audio routing auto-configured on macOS with SwitchAudioSource + BlackHole)
 
 Required env vars:
   GLMCP_SHADOW_HOST     - Shadow DOM host selector (e.g. #my-ext-root)
@@ -41,8 +42,11 @@ Add to .mcp.json:
 
 import sys
 import os
+import atexit
 import asyncio
 import json
+import shutil
+import subprocess
 import time
 import urllib.request
 
@@ -65,6 +69,67 @@ DEFAULT_TEST_URL = os.environ.get('GLMCP_DEFAULT_URL', 'https://en.wikipedia.org
 VOICE_SCRIPT = os.environ.get('GLMCP_VOICE_SCRIPT', '')
 
 mcp = FastMCP('gemini-live-mcp')
+
+# ---------------------------------------------------------------------------
+# Audio routing (macOS + SwitchAudioSource + BlackHole)
+# ---------------------------------------------------------------------------
+
+_audio_routed = False
+_original_input = None
+_original_output = None
+
+
+def _run_switch(args):
+    """Run SwitchAudioSource with given args, return stdout."""
+    return subprocess.run(
+        ['SwitchAudioSource'] + args,
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+
+
+def _find_blackhole():
+    """Return the name of the first BlackHole device, or None."""
+    sas = shutil.which('SwitchAudioSource')
+    if not sas:
+        return None
+    out = _run_switch(['-a', '-t', 'input'])
+    for line in out.splitlines():
+        if 'BlackHole' in line:
+            return line.strip()
+    return None
+
+
+def _get_current_audio():
+    """Return (current_input, current_output) device names."""
+    inp = _run_switch(['-c', '-t', 'input'])
+    out = _run_switch(['-c', '-t', 'output'])
+    return inp, out
+
+
+def _ensure_audio_routed():
+    """Lazy-init: switch input+output to BlackHole on first voice call."""
+    global _audio_routed, _original_input, _original_output
+    if _audio_routed:
+        return
+    if not shutil.which('SwitchAudioSource'):
+        return
+    bh = _find_blackhole()
+    if not bh:
+        return
+    _original_input, _original_output = _get_current_audio()
+    _run_switch(['-s', bh, '-t', 'input'])
+    _run_switch(['-s', bh, '-t', 'output'])
+    atexit.register(_restore_audio)
+    _audio_routed = True
+
+
+def _restore_audio():
+    """atexit handler: restore original audio devices."""
+    if _original_input:
+        _run_switch(['-s', _original_input, '-t', 'input'])
+    if _original_output:
+        _run_switch(['-s', _original_output, '-t', 'output'])
+
 
 # ---------------------------------------------------------------------------
 # CDP helpers
@@ -199,12 +264,21 @@ async def get_session_state() -> str:
         except Exception:
             pass
 
+    # Audio routing status
+    if not shutil.which('SwitchAudioSource'):
+        audio_status = 'unknown (SwitchAudioSource not available)'
+    else:
+        current_input, _ = _get_current_audio()
+        routed = 'routed' if _audio_routed else 'not routed'
+        audio_status = f'{current_input} ({routed})'
+
     return (
         f'Extension ID : {ext_id}\n'
         f'Page URL     : {page_url}\n'
         f'Session state: {session_state}\n'
         f'Offscreen    : {offscreen_status}\n'
-        f'Transcripts  : {transcript_count} entries'
+        f'Transcripts  : {transcript_count} entries\n'
+        f'Audio        : {audio_status}'
     )
 
 
@@ -276,12 +350,16 @@ async def speak(text: str, use_say: bool = True) -> str:
     the extension's mic capture picks it up and sends it to Gemini.
 
     Requires: GLMCP_VOICE_SCRIPT env var set, audio routing configured.
+    On macOS with SwitchAudioSource + BlackHole installed, audio routing
+    is handled automatically on first call.
 
     Args:
         text: The utterance to speak.
         use_say: If True, use macOS `say` (offline, fast). If False, use
                  edge-tts (online, higher quality).
     """
+    _ensure_audio_routed()
+
     if not VOICE_SCRIPT:
         return 'ERROR: GLMCP_VOICE_SCRIPT not set — speak tool unavailable'
 
@@ -531,6 +609,8 @@ async def run_voice_test(
         expect: If set, assert that model response contains this text (case-insensitive).
         use_say: Use macOS say for TTS (offline, fast). Set False for edge-tts.
     """
+    _ensure_audio_routed()
+
     if not VOICE_SCRIPT:
         return 'ERROR: GLMCP_VOICE_SCRIPT not set — voice test unavailable'
 

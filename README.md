@@ -96,6 +96,24 @@ Quit Chrome completely first, then launch with the debug port:
 
 Load your extension as unpacked at `chrome://extensions` (Developer mode).
 
+## Audio Routing (macOS)
+
+The `speak` and `run_voice_test` tools need audio routed through a virtual device (BlackHole) so TTS output feeds into Chrome's mic input. On macOS, the server handles this automatically:
+
+- **Auto-routes** on the first `speak` or `run_voice_test` call — switches both input and output to BlackHole
+- **Auto-restores** your original audio devices when the MCP server shuts down (via `atexit`)
+- **Lazy** — no audio changes until you actually use a voice tool
+
+**Prerequisites:**
+
+```bash
+brew install blackhole-16ch switchaudio-osx
+```
+
+**Non-macOS:** Audio routing is skipped silently if `SwitchAudioSource` is not on PATH. Configure your virtual audio routing manually.
+
+You can check the current audio state with `get_session_state` — it shows the current input device and whether routing is active.
+
 ## Voice Testing
 
 The `speak` and `run_voice_test` tools require:
@@ -104,7 +122,7 @@ The `speak` and `run_voice_test` tools require:
 
 2. The script is called as: `python <VOICE_SCRIPT> [--say] "<text>"` where `--say` uses macOS `say` (offline, fast) and omitting it uses an alternative like edge-tts.
 
-3. Audio routing configured so the virtual audio device is set as the mic input that Chrome captures.
+3. Audio routing — handled automatically on macOS (see above), or configure manually on other platforms.
 
 ## Transcript Contract
 
