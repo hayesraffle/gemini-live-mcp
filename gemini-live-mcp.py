@@ -61,6 +61,7 @@ import os
 import atexit
 import asyncio
 import json
+import signal
 import shutil
 import subprocess
 import time
@@ -147,13 +148,23 @@ def _ensure_audio_routed():
 
 
 def _restore_audio():
-    """Restore original OS audio devices. Called by stop_session and atexit."""
+    """Restore original OS audio devices. Called by stop_session, atexit, and signals."""
     global _audio_routed
     if _original_input:
         _run_switch(['-s', _original_input, '-t', 'input'])
     if _original_output:
         _run_switch(['-s', _original_output, '-t', 'output'])
     _audio_routed = False
+
+
+def _signal_handler(signum, frame):
+    """Restore audio on SIGTERM/SIGINT before exiting."""
+    _restore_audio()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
 
 
 async def _reset_chrome_mic():
