@@ -620,6 +620,7 @@ async def listen(timeout: int = 60, baseline: int = -1) -> str:
     deadline = t_start + timeout
     entries = []
 
+    navigated = False
     async with websockets.connect(ws_url, open_timeout=5) as ws:
         while time.time() < deadline:
             result = await _cdp_send(ws, 'Runtime.evaluate', {
@@ -629,18 +630,29 @@ async def listen(timeout: int = 60, baseline: int = -1) -> str:
             raw = result.get('result', {}).get('value')
             if raw:
                 entries = json.loads(raw)
+                # Detect transcript reset (navigation caused offscreen doc restart)
+                if len(entries) < baseline:
+                    baseline = 0
+                    navigated = True
                 new = entries[baseline:]
                 user = next((e['text'] for e in new if e['role'] == 'user'), None)
                 model = next((e['text'] for e in new if e['role'] == 'model'), None)
                 if user and model:
                     elapsed = time.time() - t_start
+                    nav_note = ' (session reconnected after navigation)' if navigated else ''
                     return (
                         f'User  : {user}\n'
                         f'Model : {model}\n'
-                        f'Elapsed: {elapsed:.1f}s'
+                        f'Elapsed: {elapsed:.1f}s{nav_note}'
                     )
             await asyncio.sleep(1)
 
+    if navigated:
+        return (
+            f'ERROR: Transcript not captured within {timeout}s. '
+            f'Navigation detected (transcripts reset from baseline={baseline} to {len(entries)}). '
+            f'Session may still be reconnecting.'
+        )
     return (
         f'ERROR: No transcript within {timeout}s '
         f'(baseline={baseline}, current={len(entries)})'
@@ -956,6 +968,7 @@ async def run_voice_test(
     # Poll for transcript
     deadline = time.time() + 90
     user_text = model_text = None
+    navigated = False
     async with websockets.connect(mcp_ws_url, open_timeout=5) as ws:
         while time.time() < deadline:
             r = await _cdp_send(ws, 'Runtime.evaluate', {
@@ -965,6 +978,10 @@ async def run_voice_test(
             raw = r.get('result', {}).get('value')
             if raw:
                 entries = json.loads(raw)
+                # Detect transcript reset (navigation caused offscreen doc restart)
+                if len(entries) < baseline:
+                    baseline = 0
+                    navigated = True
                 new = entries[baseline:]
                 user_text = next((e['text'] for e in new if e['role'] == 'user'), None)
                 model_text = next((e['text'] for e in new if e['role'] == 'model'), None)
@@ -976,12 +993,14 @@ async def run_voice_test(
     response_latency = t_done - t_speech_done
 
     if not (user_text and model_text):
-        return f'ERROR: Transcript not captured within 90s (baseline={baseline})'
+        nav_info = ' (navigation detected — transcripts reset)' if navigated else ''
+        return f'ERROR: Transcript not captured within 90s (baseline={baseline}){nav_info}'
 
+    nav_note = '  (session reconnected after navigation)\n' if navigated else ''
     lines = [
         f'Test: "{utterance}"',
         '-' * 60,
-        f'  User  : {user_text}',
+        f'{nav_note}  User  : {user_text}',
         f'  Model : {model_text}',
         '-' * 60,
         f'  Speech duration : {speech_duration:.1f}s',
