@@ -1,10 +1,71 @@
 # gemini-live-mcp
 
-A generic [MCP](https://modelcontextprotocol.io/) server for interacting with **Gemini Live** Chrome extensions and web apps from AI coding agents like [Claude Code](https://claude.ai/code).
+A generic [MCP](https://modelcontextprotocol.io/) server for interacting with **Gemini Live** Chrome extensions and web apps from any MCP-compatible AI agent — [Claude Code](https://claude.ai/code), [Cursor](https://cursor.sh), or your own.
 
-It connects to Chrome via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) and exposes tools to start/stop voice sessions, speak utterances, capture transcripts, inspect state, and run end-to-end voice tests -- all from your MCP client.
+It connects to Chrome via the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) and exposes tools to start/stop voice sessions, speak utterances, capture transcripts, inspect state, and run end-to-end voice tests — all programmatically.
 
-**Two modes:**
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  MCP Client (Claude Code, Cursor, custom agent, etc.)           │
+│                                                                 │
+│  Calls MCP tools: start_session, speak, listen, run_voice_test  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ MCP protocol (stdio)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  gemini-live-mcp.py                                             │
+│                                                                 │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
+│  │ Session mgmt │  │ Voice tools  │  │ Transcript capture     │ │
+│  │ (CDP clicks, │  │ (TTS → Black │  │ (poll window prop via  │ │
+│  │  navigation) │  │  Hole → mic) │  │  CDP Runtime.evaluate) │ │
+│  └──────┬───────┘  └──────┬───────┘  └───────────┬────────────┘ │
+└─────────┼─────────────────┼──────────────────────┼──────────────┘
+          │ CDP              │ audio                │ CDP
+          ▼                  ▼                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Chrome (--remote-debugging-port=9222)                          │
+│                                                                 │
+│  ┌─────────────────┐    ┌────────────────────────────────────┐  │
+│  │  Page            │◄──►│  Extension / Web App               │  │
+│  │  (content script │    │  ┌──────────────────────────────┐  │  │
+│  │   or __mcp       │    │  │  Offscreen doc / session hub  │  │  │
+│  │   bridge)        │    │  │  - Gemini Live WebSocket      │  │  │
+│  │                  │    │  │  - Mic capture (BlackHole)     │  │  │
+│  │                  │    │  │  - Audio playback              │  │  │
+│  │                  │    │  │  - Transcript accumulation     │  │  │
+│  └─────────────────┘    │  └──────────────────────────────┘  │  │
+│                          └────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ WebSocket
+                                    ▼
+                          ┌───────────────────┐
+                          │  Gemini Live API   │
+                          │  (Google AI or     │
+                          │   Vertex AI)       │
+                          └───────────────────┘
+```
+
+### Voice test flow
+
+```
+Agent calls run_voice_test("what is this page about")
+    │
+    ├─► Navigate to URL
+    ├─► Click FAB button (starts Gemini Live session)
+    ├─► Wait for offscreen doc / session to connect
+    ├─► Route OS audio: input + output → BlackHole
+    ├─► TTS "what is this page about" → BlackHole → Chrome mic
+    ├─► Poll offscreen doc for new transcript entries
+    ├─► Capture user + model transcripts
+    ├─► Assert model response contains expected text
+    └─► Return results + latency metrics
+```
+
+## Two Modes
 
 - **Extension mode** (default): For Chrome extensions with Shadow DOM overlays + offscreen documents. All extension-specific details (selectors, extension name, transcript property) are configured via environment variables.
 - **Webapp mode**: For web apps (React, etc.) that expose a `window.__mcp` bridge object. No extension-specific config needed.
@@ -13,23 +74,21 @@ It connects to Chrome via the [Chrome DevTools Protocol](https://chromedevtools.
 
 - Python 3.10+
 - Chrome running with `--remote-debugging-port=9222`
-- Extension mode: your Gemini Live extension loaded in Chrome
-- Webapp mode: your web app running (e.g. via Vite dev server)
 - Python packages: `websockets`, `mcp`
-
-## Installation
-
-```bash
-pip install websockets mcp
-```
-
-Or with a virtual environment:
+- **For voice tools** (macOS):
+  - [BlackHole](https://existential.audio/blackhole/) — virtual audio device for routing TTS into Chrome's mic
+  - [SwitchAudioSource](https://github.com/deweller/switchaudio-osx) — CLI tool for switching audio devices
+  - A TTS script (pointed to by `GLMCP_VOICE_SCRIPT`)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+# Python deps
 pip install websockets mcp
+
+# macOS audio deps (for voice tools)
+brew install blackhole-16ch switchaudio-osx
 ```
+
+**Non-macOS:** Audio routing is skipped silently if `SwitchAudioSource` is not on PATH. Configure your virtual audio routing manually.
 
 ## Configuration
 
@@ -92,18 +151,66 @@ Add to your `.mcp.json` (e.g. in your project root for Claude Code):
 
 | Tool | Description |
 |------|-------------|
-| `get_session_state` | Check page URL, session status, transcript count, audio routing |
 | `start_session` | Navigate to a URL and start a Gemini Live session |
-| `stop_session` | End the session |
+| `stop_session` | End the current session cleanly |
 | `speak` | Generate TTS audio and play it into a virtual mic (requires `GLMCP_VOICE_SCRIPT`) |
 | `listen` | Poll for new user+model transcript pair with timeout |
+| `run_voice_test` | Full E2E test: navigate → start → speak → capture → assert (with latency) |
+| `get_session_state` | Page URL, session status, transcript count, audio routing |
 | `get_transcripts` | Return the last N transcript entries |
-| `get_logs` | Return recent logs (console or structured) |
+| `get_logs` | Return recent console logs from offscreen doc or page |
 | `eval_page` | Evaluate JavaScript in the main page context |
-| `eval_offscreen` | Evaluate JavaScript in the offscreen/page context |
+| `eval_offscreen` | Evaluate JavaScript in the offscreen/hub document context |
 | `navigate` | Navigate the main page to a URL |
 | `reload_extension` | Reload the extension via `chrome://extensions` (extension mode only) |
-| `run_voice_test` | Full end-to-end test: navigate, start session, speak, capture transcript, assert |
+
+## Audio Routing (macOS)
+
+The `speak` and `run_voice_test` tools route audio through BlackHole so TTS output feeds into Chrome's mic input.
+
+- **Auto-routes** on the first `speak` or `run_voice_test` call — switches OS input + output to BlackHole
+- **Auto-restores** your original audio devices on shutdown (via `atexit` + SIGTERM/SIGINT signal handlers)
+- **Lazy** — no audio changes until you actually use a voice tool
+
+Check the current state with `get_session_state` — it reports the active input device and whether routing is active.
+
+**Important:** Chrome persists its own mic preference separately from the OS default (`chrome://settings/content/microphone`). The `stop_session` tool resets this back to "System default" automatically.
+
+## Chrome Setup
+
+Quit Chrome completely first (Cmd+Q on macOS), then launch with the debug port:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/gemini-live-mcp-test \
+  --no-first-run \
+  --no-default-browser-check \
+  "about:blank"
+```
+
+- **Extension mode**: Load your extension as unpacked at `chrome://extensions` (Developer mode).
+- **Webapp mode**: Open your web app URL (e.g. `http://localhost:5173`).
+
+## Voice Testing
+
+The `speak` and `run_voice_test` tools require `GLMCP_VOICE_SCRIPT` set to a script that generates TTS audio and plays it through BlackHole.
+
+The script is called as:
+```bash
+python <VOICE_SCRIPT> [--say] "<text>"
+```
+
+- `--say` uses macOS `say` (offline, fast)
+- Without `--say`, use an alternative like `edge-tts` (online, higher quality)
+
+## Transcript Contract
+
+**Extension mode:** Reads `window.<GLMCP_TRANSCRIPT_PROP>` on the offscreen document — an array of `{ role: 'user' | 'model', text: string }`. Defaults to `__tcTranscripts`.
+
+**Webapp mode:** Reads `window.__mcp.transcripts` on the page — same format.
+
+The `listen` and `run_voice_test` tools handle transcript array resets after navigation (when the offscreen doc restarts, the array resets to empty — the tools detect this and adjust their baseline automatically).
 
 ## `window.__mcp` Bridge Contract (Webapp Mode)
 
@@ -122,8 +229,6 @@ interface MCPBridge {
 
 ### Adding the bridge to a React app
 
-Add a `useEffect` that syncs your React state to `window.__mcp`:
-
 ```tsx
 useEffect(() => {
   (window as any).__mcp = {
@@ -135,59 +240,6 @@ useEffect(() => {
   return () => { delete (window as any).__mcp; };
 }, [transcriptHistory, isConnected, startSession, stopSession]);
 ```
-
-A TypeScript helper module (`mcp-bridge.ts`) is also provided for convenience.
-
-## Chrome Setup
-
-Quit Chrome completely first, then launch with the debug port:
-
-```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/gemini-live-mcp-test \
-  --no-first-run \
-  --no-default-browser-check \
-  "about:blank"
-```
-
-Extension mode: load your extension as unpacked at `chrome://extensions` (Developer mode).
-
-Webapp mode: open your web app URL (e.g. `http://localhost:5173`).
-
-## Audio Routing (macOS)
-
-The `speak` and `run_voice_test` tools need audio routed through a virtual device (BlackHole) so TTS output feeds into Chrome's mic input. On macOS, the server handles this automatically:
-
-- **Auto-routes** on the first `speak` or `run_voice_test` call — switches both input and output to BlackHole
-- **Auto-restores** your original audio devices when the MCP server shuts down (via `atexit`)
-- **Lazy** — no audio changes until you actually use a voice tool
-
-**Prerequisites:**
-
-```bash
-brew install blackhole-16ch switchaudio-osx
-```
-
-**Non-macOS:** Audio routing is skipped silently if `SwitchAudioSource` is not on PATH. Configure your virtual audio routing manually.
-
-You can check the current audio state with `get_session_state` — it shows the current input device and whether routing is active.
-
-## Voice Testing
-
-The `speak` and `run_voice_test` tools require:
-
-1. **`GLMCP_VOICE_SCRIPT`** set to a script that generates TTS audio and plays it through a virtual audio device (like BlackHole on macOS) so the extension's mic capture picks it up.
-
-2. The script is called as: `python <VOICE_SCRIPT> [--say] "<text>"` where `--say` uses macOS `say` (offline, fast) and omitting it uses an alternative like edge-tts.
-
-3. Audio routing — handled automatically on macOS (see above), or configure manually on other platforms.
-
-## Transcript Contract
-
-**Extension mode:** The server reads transcripts from `window.<GLMCP_TRANSCRIPT_PROP>` on the offscreen document — an array of `{ role: 'user' | 'model', text: string }`. Defaults to `__tcTranscripts`.
-
-**Webapp mode:** The server reads `window.__mcp.transcripts` on the page — same format.
 
 ## License
 
