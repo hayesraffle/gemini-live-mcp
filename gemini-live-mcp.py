@@ -101,6 +101,7 @@ mcp = FastMCP('gemini-live-mcp')
 _audio_routed = False
 _original_input = None
 _original_output = None
+_AUDIO_STATE_FILE = '/tmp/gemini-live-mcp-audio-state.json'
 
 
 def _run_switch(args):
@@ -130,6 +131,51 @@ def _get_current_audio():
     return inp, out
 
 
+def _save_audio_state():
+    """Persist original audio devices to state file for crash recovery."""
+    try:
+        with open(_AUDIO_STATE_FILE, 'w') as f:
+            json.dump({'input': _original_input, 'output': _original_output}, f)
+    except OSError:
+        pass
+
+
+def _clear_audio_state():
+    """Remove the audio state file after successful restore."""
+    try:
+        os.remove(_AUDIO_STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _recover_audio_on_startup():
+    """On startup, detect orphaned BlackHole routing and restore from state file."""
+    if not shutil.which('SwitchAudioSource'):
+        return
+    cur_input, _ = _get_current_audio()
+    if 'BlackHole' not in cur_input:
+        # OS is not on BlackHole — clean up any stale state file
+        try:
+            os.remove(_AUDIO_STATE_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    # OS is stuck on BlackHole — try to recover from state file
+    try:
+        with open(_AUDIO_STATE_FILE) as f:
+            state = json.load(f)
+        orig_in = state.get('input')
+        orig_out = state.get('output')
+        if orig_in:
+            _run_switch(['-s', orig_in, '-t', 'input'])
+        if orig_out:
+            _run_switch(['-s', orig_out, '-t', 'output'])
+        os.remove(_AUDIO_STATE_FILE)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        # No state file or corrupt — can't recover automatically
+        pass
+
+
 def _ensure_audio_routed():
     """Lazy-init: switch input+output to BlackHole on first voice call."""
     global _audio_routed, _original_input, _original_output
@@ -143,6 +189,7 @@ def _ensure_audio_routed():
     _original_input, _original_output = _get_current_audio()
     _run_switch(['-s', bh, '-t', 'input'])
     _run_switch(['-s', bh, '-t', 'output'])
+    _save_audio_state()
     atexit.register(_restore_audio)
     _audio_routed = True
 
@@ -154,6 +201,7 @@ def _restore_audio():
         _run_switch(['-s', _original_input, '-t', 'input'])
     if _original_output:
         _run_switch(['-s', _original_output, '-t', 'output'])
+    _clear_audio_state()
     _audio_routed = False
 
 
@@ -165,6 +213,9 @@ def _signal_handler(signum, frame):
 
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT, _signal_handler)
+
+# Recover from previous crash that left OS on BlackHole
+_recover_audio_on_startup()
 
 
 async def _reset_chrome_mic():
