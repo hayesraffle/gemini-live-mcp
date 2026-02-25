@@ -148,8 +148,12 @@ def _clear_audio_state():
         pass
 
 
+_chrome_mic_needs_reset = False
+
+
 def _recover_audio_on_startup():
     """On startup, detect orphaned BlackHole routing and restore from state file."""
+    global _chrome_mic_needs_reset
     if not shutil.which('SwitchAudioSource'):
         return
     cur_input, _ = _get_current_audio()
@@ -171,6 +175,8 @@ def _recover_audio_on_startup():
         if orig_out:
             _run_switch(['-s', orig_out, '-t', 'output'])
         os.remove(_AUDIO_STATE_FILE)
+        # Chrome mic is likely also stuck on BlackHole — reset on first async call
+        _chrome_mic_needs_reset = True
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         # No state file or corrupt — can't recover automatically
         pass
@@ -216,6 +222,15 @@ signal.signal(signal.SIGINT, _signal_handler)
 
 # Recover from previous crash that left OS on BlackHole
 _recover_audio_on_startup()
+
+
+async def _maybe_recover_chrome_mic():
+    """If a previous crash left Chrome's mic on BlackHole, reset it now."""
+    global _chrome_mic_needs_reset
+    if not _chrome_mic_needs_reset:
+        return
+    _chrome_mic_needs_reset = False
+    await _reset_chrome_mic()
 
 
 async def _reset_chrome_mic():
@@ -387,6 +402,7 @@ async def get_session_state() -> str:
     page URL, whether the session is active, transcript count, and audio status.
     In extension mode, also includes extension ID and offscreen doc status.
     """
+    await _maybe_recover_chrome_mic()
     page = _get_page_target()
     page_url = page.get('url', 'unknown')
 
